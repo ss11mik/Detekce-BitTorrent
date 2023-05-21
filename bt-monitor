@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+#
+# project: Bittorrent Traffic Detection
+# author: xmikul69
+# course: PDS @ FIT VUT
+# 2023
+
+import argparse
+import csv
+import re
+from scapy.all import *
+from scapy.layers.http import *
+
+# csv cols
+FRAME=0
+TIME=1
+IP_SRC=2
+IP_DST=3
+PORT_SRC=4
+PORT_DST=5
+
+DHT_IP=6
+DHT_PORT=7
+DHT_STRING=8
+
+BT_PIECE_INDEX=9
+BT_MSG_TYPE=10
+BT_INFO_HASH=11
+BT_LEN=12
+
+UDP_PAYLOAD=13
+
+DNS_ADDR=14
+
+
+class Neighbour:
+
+    def __init__(n, ip, port, node, conns, has_node_id):
+        n.ip = ip
+        n.port = port
+        n.node = node
+        n.conns = conns
+        n.has_node_id = has_node_id
+
+    ip = 0
+    port = 0
+    node = 0
+    conns = 0
+    has_node_id = False
+
+class Chunk:
+
+    def __init__(n, ip, port, chunk, downloaded_times, size):
+        n.ip = ip
+        n.port = port
+        n.chunk = chunk
+        n.downloaded_times = downloaded_times
+        n.size = size
+
+    chunk = 0
+    ip = 0
+    port = 0
+    downloaded_times = 0
+    size = 0
+
+
+# naive detection of malformed IP addresses that are returned by ICMP in case of error but are still processed by tshark
+def icmp_error(string):
+    return "," in string
+
+# list contacted bootstrap nodes
+# detect by 'bs' flag in request
+def init1(csv_file):
+
+    with open(csv_file) as f:
+        csvreader = csv.reader(f, delimiter=';')
+        print("IP:port")
+
+        for row in csvreader:
+            if 'bs' in row[DHT_STRING]:
+                print(f"{row[IP_DST]}:{row[PORT_DST]}")
+
+
+# list contacted bootstrap nodes
+# detect nodes that have not been seen in any previous response
+def init2(csv_file):
+
+    with open(csv_file) as f:
+        csvreader = csv.reader(f, delimiter=';')
+        rows = list(csvreader)
+        print("IP:port")
+
+        got = {}
+
+        for row in rows:
+            if 'y,r' in row[DHT_STRING] and len(row[DHT_IP]) > 1:
+
+                # peers sent in response
+                ips = row[DHT_IP].split(',')
+                ports = row[DHT_PORT].split(',')
+
+                for i in range(0, len(ips)):
+                    peer = f"{ips[i]}:{ports[i]}"
+                    got[peer] = 1
+
+        for row in rows:
+            if 'get_peers' in row[DHT_STRING] or 'find_nodes' in row[DHT_STRING]:
+                peer = f"{row[IP_DST]}:{row[PORT_DST]}"
+                if got.get(peer, 0) == 0:
+                    if not icmp_error(peer):
+                        print(peer)
+                        got[peer] = 1
+
+
+# list contacted bootstrap nodes
+# detect contacted nodes that have been resolved by DNS
+def init3(csv_file):
+
+    with open(csv_file) as f:
+        csvreader = csv.reader(f, delimiter=';')
+        rows = list(csvreader)
+        print("IP:port")
+
+        resolved_ips = []
+        got = {}
+
+        for row in rows:
+            if len(row[DNS_ADDR]) > 0:
+                ips = row[DNS_ADDR].split(',')
+                resolved_ips += ips
+
+        for row in rows:
+            if 'get_peers' in row[DHT_STRING] or 'find_nodes' in row[DHT_STRING]:
+                if row[IP_DST] in resolved_ips:
+                    peer = f"{row[IP_DST]}:{row[PORT_DST]}"
+                    if got.get(peer, 0) == 0:
+                        if not icmp_error(peer):
+                            print(peer)
+                            got[peer] = 1
+
+
+# get a list of peers
+def peers_csv(csv_file):
+    with open(csv_file) as f:
+        csvreader = csv.reader(f, delimiter=';')
+
+        neighbours = {}
+
+        for row in csvreader:
+            # responses
+            if 'y,r' in row[DHT_STRING]:
+                node_id = re.search(r'id,[0-9a-f]+', row[DHT_STRING]).group(0)[3:]
+                prev_neighbour = neighbours.get(node_id, None)
+                if prev_neighbour != None:
+                    prev_conns = prev_neighbour.conns + 1
+                else:
+                    prev_conns = 1
+
+                neighbours[node_id] = Neighbour(row[IP_SRC], row[PORT_SRC], node_id, prev_conns, True)
+
+            #                      piece
+            if row[BT_MSG_TYPE] == "7":
+                node_id = row[IP_SRC]
+                prev_neighbour = neighbours.get(node_id, None)
+                if prev_neighbour != None:
+                    prev_conns = prev_neighbour.conns + 1
+                else:
+                    prev_conns = 1
+
+                neighbours[node_id] = Neighbour(row[IP_SRC], row[PORT_SRC], node_id, prev_conns, False)
+
+
+        print("IP:port,               node ID,                                  no. of conns.")
+        for i in neighbours.values():
+            if i.has_node_id:
+                node_id = i.node
+            else:
+                node_id = "(unknown)"
+            print(f"{(str(i.ip) + ':' + str(i.port) + ',').ljust(22)} {(str(node_id) + ',').ljust(41)} {i.conns}")
+
+
+# detect info_hash of downloaded torrent, peers and chunks
+def download(csv_file):
+
+    with open(csv_file) as f:
+        csvreader = csv.reader(f, delimiter=';')
+
+        pieces = {}
+        info_hashes = {}
+        first_observed = -1
+        last_observed = 0
+
+        for row in csvreader:
+            # info hashes
+            if row[BT_INFO_HASH]:
+                info_hashes[row[BT_INFO_HASH]] = row[BT_INFO_HASH]
+                first_observed = float(row[TIME])
+
+            # "piece"
+            if row[BT_MSG_TYPE] == "7":
+                pieces[row[BT_PIECE_INDEX]] = Chunk(row[IP_SRC], row[PORT_SRC], row[BT_PIECE_INDEX], 1, int(row[BT_LEN]))
+                last_observed = float(row[TIME])
+
+                # in case only the transmission of data is captured
+                if first_observed == -1:
+                    last_observed = float(row[TIME])
+
+        print("info hashes:")
+        for i in info_hashes.values():
+            print(i)
+
+        total_size = 0
+        print("\ncontributor IP:port,   Chunk index, size,  downloaded times")
+        for i in pieces.values():
+            print(f"{(str(i.ip) + ':' + str(i.port) + ',').ljust(22)} {i.chunk},  {str(i.size).ljust(5)}, {i.downloaded_times}")
+            total_size += i.size
+
+        print(f"\nComputed total size: {total_size} B")
+        print(f"Observed download time: {round(last_observed - first_observed, 3)} s, from {round(first_observed, 3)} to {round(last_observed, 3)}")
+
+
+# detect DNS queries with BT-related keywords
+def dns(pcap_file):
+
+    domains = {}
+
+    pcap = rdpcap(pcap_file)
+    for pkt in pcap:
+        if DNS in pkt:
+            query = str(pkt[DNS].qd.qname, 'ascii').lower()
+
+            if "torrent" in query or "tracker" in query or "dht" in query:
+                domains[query] = 1
+
+    for i in domains.keys():
+        print(i)
+
+
+# detect HTTP (over UDP) traffic with BT-related keywords
+def http(pcap_file):
+
+    pcap = rdpcap(pcap_file)
+
+    print("IP:port,               payload")
+    for pkt in pcap:
+        sport = 0
+        dport = 0
+        protocol = None
+        if IP in pkt:
+            ip_src=pkt[IP].src
+            ip_dst=pkt[IP].dst
+        if UDP in pkt:
+            sport=pkt[UDP].sport
+            dport=pkt[UDP].dport
+            protocol = UDP
+        if TCP in pkt:
+            sport=pkt[TCP].sport
+            dport=pkt[TCP].dport
+            protocol = TCP
+
+        if sport == 80 or dport == 80 or sport == 8080 or dport == 8080 or sport == 8081 or dport == 8081  or sport == 8000 or dport == 8000 or sport == 8888 or dport == 8888 or sport == 8990 or dport == 8990:
+            if protocol == UDP:
+                payload = pkt[UDP].load
+            elif protocol == TCP:
+                payload = pkt[TCP].payload
+
+            if b"/announce" in payload:
+                print(f"{(str(ip_dst) + ':' + str(dport) + ',').ljust(22)} {payload}")
+
+            if b"/scrape" in payload:
+                print(f"{(str(ip_dst) + ':' + str(dport) + ',').ljust(22)} {payload}")
+
+
+# detection by commonly used ports
+# both TCP and UDP
+def ports(pcap_file):
+
+    pcap = rdpcap(pcap_file)
+
+    hosts = {}
+
+    torrent_ports = [
+        #<-            port range from spec                ->
+        6881, 6882, 6883, 6884, 6885, 6886, 6887, 6888, 6889,
+        8990,   # used by libtorrent
+        6969    # used by trackers
+    ]
+
+    print("IP:port,               direction")
+    for pkt in pcap:
+        sport = 0
+        dport = 0
+        if IP in pkt:
+            ip_src=pkt[IP].src
+            ip_dst=pkt[IP].dst
+        if UDP in pkt:
+            sport=pkt[UDP].sport
+            dport=pkt[UDP].dport
+        elif TCP in pkt:
+            sport=pkt[TCP].sport
+            dport=pkt[TCP].dport
+
+        for port in torrent_ports:
+            if sport == port:
+                hosts[(ip_src, sport, "->")] = 1
+
+            if dport == port:
+                hosts[(ip_dst, dport, "<-")] = 1
+
+    for i in hosts.keys():
+        print(f"{(str(i[0]) + ':' + str(i[1]) + ',').ljust(22)} {i[2]}")
+
+
+# find BitTorrent ping messages
+def ping(csv_file):
+
+    with open(csv_file) as f:
+        csvreader = csv.reader(f, delimiter=';')
+
+        pieces = {}
+        info_hashes = {}
+
+        for row in csvreader:
+
+            if "ping" in row[DHT_STRING]:
+                if not icmp_error(row[IP_SRC]):
+                    print(f"{row[IP_SRC]}:{row[PORT_SRC]} -> {row[IP_DST]}:{row[PORT_DST]}")
+
+
+# detecting ports used for both TCP and UDP
+def tcp_and_udp_port(pcap_file):
+    pcap = rdpcap(pcap_file)
+
+    tcp_ports = {}
+    udp_ports = {}
+
+    for pkt in pcap:
+        if IP in pkt:
+            ip_src=pkt[IP].src
+            ip_dst=pkt[IP].dst
+
+            if UDP in pkt:
+                udp_ports[(ip_src, pkt[UDP].sport)] = 1
+                udp_ports[(ip_dst, pkt[UDP].dport)] = 1
+
+            elif TCP in pkt:
+                tcp_ports[(ip_src, pkt[TCP].sport)] = 1
+                tcp_ports[(ip_dst, pkt[TCP].dport)] = 1
+
+
+    for (ip, port) in udp_ports.keys():
+        if (ip, port) in tcp_ports.keys():
+            print(f"{ip}:{port}")
+
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description='Bittorrent Traffic Detection')
+
+    parser.add_argument('-init', action='store_true', help='list contacted bootstrap nodes')
+    parser.add_argument('-peers', action='store_true', help='get a list of peers')
+    parser.add_argument('-download', action='store_true', help='detect info_hash of downloaded torrent, peers and chunks')
+
+    parser.add_argument('-dns', action='store_true', help='detect DNS queries with BT-related keywords')
+    parser.add_argument('-http', action='store_true', help='detect HTTP (over UDP) traffic with BT-related keywords')
+    parser.add_argument('-ports', action='store_true', help='detection by commonly used ports, both TCP and UDP')
+    parser.add_argument('-ping', action='store_true', help='find BitTorrent ping messages')
+    parser.add_argument('-tcpudpport', action='store_true', help='detecting ports used for both TCP and UDP')
+
+    # parser.add_argument('-pcap', type=argparse.FileType('r'))
+    parser.add_argument('-pcap', type=str, help='input .pcap file')
+    # parser.add_argument('-csv', type=argparse.FileType('r'))
+    parser.add_argument('-csv', type=str, help='input .csv file')
+
+
+    args = parser.parse_args()
+
+    pcap = args.pcap
+    csv = args.csv
+
+
+    if args.init:
+        if not csv:
+            print("unsupported. Try with csv.")
+            exit(1)
+        print("method 1:")
+        init1(csv)
+        print("method 2:")
+        init2(csv)
+        print("method 3:")
+        init3(csv)
+    elif args.peers:
+        if not csv:
+            print("unsupported. Try with csv.")
+            exit(1)
+        else:
+            peers_csv(csv)
+    elif args.download:
+        if not csv:
+            print("unsupported. Try with csv.")
+            exit(1)
+        download(csv)
+
+    elif args.dns:
+        if not pcap:
+            print("unsupported. Try with pcap.")
+            exit(1)
+        dns(pcap)
+    elif args.http:
+        if not pcap:
+            print("unsupported. Try with pcap.")
+            exit(1)
+        http(pcap)
+    elif args.ports:
+        if not pcap:
+            print("unsupported. Try with pcap.")
+            exit(1)
+        ports(pcap)
+    elif args.tcpudpport:
+        if not pcap:
+            print("unsupported. Try with pcap.")
+            exit(1)
+        tcp_and_udp_port(pcap)
+    elif args.ping:
+        if not csv:
+            print("unsupported. Try with csv.")
+            exit(1)
+        ping(csv)
+    else:
+        exit(2)
+
+if __name__ == "__main__":
+    main()
+
